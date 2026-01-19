@@ -1,0 +1,456 @@
+// ==========================================
+// 8. レポート出力用 (EXPORT TO SHEET - 最終完全版)
+// ==========================================
+
+/**
+ * Phase 3: レポート用取引を「商品明細単位」でスプレッドシートに出力する関数
+ * ※ 親取引名・親計上日を先頭に配置
+ * ※ 会社名抽出ロジックを「YYYY年」を基準に分割するように強化
+ * ※ 対象年月(YYYY-MM)の昇順でソート
+ */
+function exportReportDealsToSheet() {
+  const EXPORT_SHEET_NAME = 'raw_report_data';
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(EXPORT_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(EXPORT_SHEET_NAME);
+  }
+
+  Logger.log("📤 レポート用データの明細エクスポートを開始します...");
+
+  // 1. レポート用パイプラインの全Deal IDを取得
+  const allDealsIndex = fetchAllReportDealIds();
+  Logger.log(`🔍 取引件数: ${allDealsIndex.length}件`);
+
+  if (allDealsIndex.length === 0) {
+    Logger.log("データがないため終了します。");
+    return;
+  }
+
+  const dealIds = allDealsIndex.map(d => d.id);
+
+  // 2. Dealのプロパティを一括取得
+  const dealsMap = batchFetchDealsProperties(dealIds);
+
+  // 3. 親取引(Origin Deal)の名前と計上日を一括取得
+  let parentIds = [];
+  dealIds.forEach(id => {
+    const d = dealsMap.get(id);
+    if (d && d.origin_deal_id) {
+      parentIds.push(d.origin_deal_id);
+    }
+  });
+  parentIds = [...new Set(parentIds)];
+  const parentDealsMap = batchFetchDealsProperties(parentIds); 
+  Logger.log(`👪 親取引数: ${parentIds.length}件の情報を取得しました`);
+
+  // 4. DealとLine Itemの紐付け(Association)を一括取得
+  const associationsMap = batchFetchDealAssociations(dealIds);
+
+  // 5. Line Itemの詳細を一括取得
+  let allLineItemIds = [];
+  associationsMap.forEach(ids => {
+    allLineItemIds = allLineItemIds.concat(ids);
+  });
+  allLineItemIds = [...new Set(allLineItemIds)];
+  const lineItemsMap = batchFetchLineItemDetails(allLineItemIds);
+
+  Logger.log(`📦 商品項目数: ${allLineItemIds.length}件を取得しました`);
+
+  // 6. 書き込み用配列の作成
+  const headerRow = [
+    "Deal ID", "親取引名", "親取引計上日", "取引名", "会社名", "対象年月", "ステージ", "担当者ID", "契約確度",
+    "商品名", "単価", "数量", "金額(LineItem)"
+  ];
+  
+  // データ行格納用
+  const dataRows = [];
+
+  dealIds.forEach(dealId => {
+    const dealProps = dealsMap.get(dealId);
+    if (!dealProps) return;
+
+    const dealName = dealProps.dealname || "";
+    
+    // 親取引情報の取得
+    const originId = dealProps.origin_deal_id;
+    let parentDealName = "";
+    let parentFirstRecordedDate = "";
+
+    if (originId) {
+      const parentDeal = parentDealsMap.get(originId);
+      if (parentDeal) {
+        parentDealName = parentDeal.dealname;
+        parentFirstRecordedDate = parentDeal.first_recorded_date || "";
+      } else {
+        parentDealName = "(削除済/取得不可)";
+      }
+    }
+
+    // ★修正箇所: 会社名・年月抽出ロジック (正規表現版)
+    // 「スペース + 数字4桁 + 年」を探す (例: " 2025年")
+    let companyName = dealName;
+    let targetMonth = "";
+    
+    // 正規表現: 半角スペース + 20xx年
+    const datePatternIndex = dealName.search(/\s20\d{2}年/);
+
+    if (datePatternIndex !== -1) {
+      // 見つかった場所より前 = 会社名
+      companyName = dealName.substring(0, datePatternIndex);
+      // 見つかった場所のスペースを除いて後ろ = 年月
+      targetMonth = dealName.substring(datePatternIndex + 1);
+    } else {
+      // 万が一マッチしない場合（過去データなど）は従来の最後のスペース分割を試みる
+      const lastSpace = dealName.lastIndexOf(" ");
+      if (lastSpace !== -1) {
+        companyName = dealName.substring(0, lastSpace);
+        targetMonth = dealName.substring(lastSpace + 1);
+      }
+    }
+
+    // first_recorded_date があれば優先して年月を上書き
+    if (dealProps.first_recorded_date) {
+      const d = new Date(dealProps.first_recorded_date);
+      const yyyy = d.getFullYear();
+      const mm = ("0" + (d.getMonth() + 1)).slice(-2);
+      targetMonth = `${yyyy}-${mm}`;
+    }
+
+    const commonData = [
+      dealId,
+      parentDealName,          // 親取引名
+      parentFirstRecordedDate, // 親取引計上日
+      dealName,                // 取引名
+      companyName,             // ★正規表現で抽出された会社名
+      targetMonth,
+      dealProps.dealstage,
+      dealProps.hubspot_owner_id,
+      dealProps.contract_certainty
+    ];
+
+    const linkedLineItemIds = associationsMap.get(dealId) || [];
+
+    if (linkedLineItemIds.length > 0) {
+      linkedLineItemIds.forEach(liId => {
+        const item = lineItemsMap.get(liId);
+        if (item) {
+          dataRows.push([
+            ...commonData,
+            item.name,
+            Number(item.price || 0),
+            Number(item.quantity || 0),
+            Number(item.amount || 0)
+          ]);
+        } else {
+          dataRows.push([...commonData, "(詳細取得失敗)", 0, 0, 0]);
+        }
+      });
+    } else {
+      dataRows.push([...commonData, "(商品なし)", 0, 0, 0]);
+    }
+  });
+
+  // ★並び替え実行 (対象年月: Index 5 の昇順)
+  dataRows.sort((a, b) => {
+    // 1. 対象年月で比較
+    if (a[5] < b[5]) return -1;
+    if (a[5] > b[5]) return 1;
+    
+    // 2. 年月が同じなら会社名(Index 4)で比較
+    if (a[4] < b[4]) return -1;
+    if (a[4] > b[4]) return 1;
+
+    return 0;
+  });
+
+  const finalRows = [headerRow, ...dataRows];
+
+  // 7. シートへ書き込み
+  sheet.clear();
+  if (finalRows.length > 0) {
+    sheet.getRange(1, 1, finalRows.length, finalRows[0].length).setValues(finalRows);
+    sheet.getRange(1, 1, 1, finalRows[0].length).setFontWeight("bold").setBackground("#f3f3f3");
+    sheet.setFrozenRows(1);
+  }
+
+  Logger.log("✅ 明細エクスポート完了: raw_report_data を更新しました(年号区切り版)。");
+}
+
+// ----------------------------------------------------
+// 以下、必須のヘルパー関数群 (省略なし・変更なし)
+// ----------------------------------------------------
+
+function fetchAllReportDealIds() {
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/search`;
+  let allResults = [];
+  let after = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    const payload = {
+      filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: REPORT_PIPELINE_ID }] }],
+      properties: [], 
+      limit: 100,
+      after: after
+    };
+    const res = _fetchHubSpot("POST", url, payload);
+    allResults = allResults.concat(res.results || []);
+    if (res.paging && res.paging.next) {
+      after = res.paging.next.after;
+    } else {
+      hasMore = false;
+    }
+    Utilities.sleep(50);
+  }
+  return allResults;
+}
+
+function batchFetchDealsProperties(dealIds) {
+  if (dealIds.length === 0) return new Map();
+
+  const map = new Map();
+  const chunks = chunkArray(dealIds, 100);
+
+  chunks.forEach(chunk => {
+    const url = `https://api.hubapi.com/crm/v3/objects/deals/batch/read`;
+    const payload = {
+      properties: ["dealname", "dealstage", "hubspot_owner_id", "contract_certainty", "first_recorded_date", "origin_deal_id"],
+      inputs: chunk.map(id => ({ id: id }))
+    };
+    try {
+      const res = _fetchHubSpot("POST", url, payload);
+      (res.results || []).forEach(d => {
+        map.set(d.id, d.properties);
+      });
+    } catch (e) {
+      Logger.log(`Batch Fetch Deals Prop Error: ${e.message}`);
+    }
+    Utilities.sleep(100);
+  });
+  return map;
+}
+
+function batchFetchDealAssociations(dealIds) {
+  const map = new Map();
+  const chunks = chunkArray(dealIds, 100);
+  const FROM_OBJECT = "deals";
+  const TO_OBJECT = "line_items";
+
+  chunks.forEach(chunk => {
+    const url = `https://api.hubapi.com/crm/v3/associations/${FROM_OBJECT}/${TO_OBJECT}/batch/read`;
+    const payload = {
+      inputs: chunk.map(id => ({ id: id }))
+    };
+
+    try {
+      const res = _fetchHubSpot("POST", url, payload);
+      (res.results || []).forEach(r => {
+        const fromId = r.from.id;
+        const toIds = (r.to || []).map(t => t.id);
+        map.set(fromId, toIds);
+      });
+    } catch (e) {
+      Logger.log(`Batch Fetch Associations Error: ${e.message}`);
+    }
+    Utilities.sleep(100);
+  });
+  return map;
+}
+
+function batchFetchLineItemDetails(lineItemIds) {
+  const map = new Map();
+  if (lineItemIds.length === 0) return map;
+
+  const chunks = chunkArray(lineItemIds, 100);
+
+  chunks.forEach(chunk => {
+    const url = `https://api.hubapi.com/crm/v3/objects/line_items/batch/read`;
+    const payload = {
+      properties: ["name", "price", "quantity", "amount", "hs_recurring_billing_period", "hs_recurring_billing_start_date"],
+      inputs: chunk.map(id => ({ id: id }))
+    };
+
+    try {
+      const res = _fetchHubSpot("POST", url, payload);
+      (res.results || []).forEach(item => {
+        map.set(item.id, {
+          id: item.id,
+          name: item.properties.name,
+          price: item.properties.price,
+          quantity: item.properties.quantity,
+          amount: item.properties.amount,
+          period: item.properties.hs_recurring_billing_period,
+          start_date: item.properties.hs_recurring_billing_start_date
+        });
+      });
+    } catch (e) {
+      Logger.log(`Batch Fetch LineItems Error: ${e.message}`);
+    }
+    Utilities.sleep(100);
+  });
+  return map;
+}
+
+function chunkArray(array, size) {
+  const results = [];
+  for (let i = 0; i < array.length; i += size) {
+    results.push(array.slice(i, i + size));
+  }
+  return results;
+}
+
+/**
+ * 【テスト用】明細形式のエクスポート（10件限定・親情報先頭版）
+ * ※ 内部で本番用の batchFetch... 系ヘルパー関数を使用します
+ */
+function test_exportReportDeals_Detail_Limit10() {
+  const EXPORT_SHEET_NAME = 'raw_report_data';
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(EXPORT_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(EXPORT_SHEET_NAME);
+  }
+
+  Logger.log("🧪 テスト実行: 最新10件（親情報先頭）を取得します...");
+
+  // 1. 最新のDeal IDを10件だけ取得
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/search`;
+  const payload = {
+    filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: REPORT_PIPELINE_ID }] }],
+    properties: [], 
+    limit: 10,      // ★10件に制限
+    sorts: [
+      { propertyName: "hs_lastmodifieddate", direction: "DESCENDING" } // 最新順
+    ]
+  };
+
+  const res = _fetchHubSpot("POST", url, payload);
+  const dealIds = (res.results || []).map(d => d.id);
+  
+  Logger.log(`🔍 取得対象ID: ${dealIds.length}件`);
+
+  if (dealIds.length === 0) {
+    Logger.log("データがありません。");
+    return;
+  }
+
+  // 2. Dealのプロパティを一括取得 (origin_deal_id も取得)
+  const dealsMap = batchFetchDealsProperties(dealIds);
+
+  // 3. 親取引(Origin Deal)の名前と計上日を一括取得
+  let parentIds = [];
+  dealIds.forEach(id => {
+    const d = dealsMap.get(id);
+    if (d && d.origin_deal_id) {
+      parentIds.push(d.origin_deal_id);
+    }
+  });
+  parentIds = [...new Set(parentIds)];
+  const parentDealsMap = batchFetchDealsProperties(parentIds); 
+
+  // 4. DealとLine Itemの紐付け(Association)を一括取得
+  const associationsMap = batchFetchDealAssociations(dealIds);
+
+  // 5. Line Itemの詳細を一括取得
+  let allLineItemIds = [];
+  associationsMap.forEach(ids => {
+    allLineItemIds = allLineItemIds.concat(ids);
+  });
+  allLineItemIds = [...new Set(allLineItemIds)];
+  const lineItemsMap = batchFetchLineItemDetails(allLineItemIds);
+
+  Logger.log(`📦 商品項目数: ${allLineItemIds.length}件`);
+
+  // 6. 書き込み用配列の作成
+  // ★並び順を変更: 親取引名、親計上日を左側に配置
+  const rows = [
+    [
+      "Deal ID", "親取引名", "親取引計上日", "取引名", "会社名", "対象年月", "ステージ", "担当者ID", "契約確度", "計上日(月次)",
+      "商品名", "単価", "数量", "金額(LineItem)", "期間", "開始日"
+    ]
+  ];
+
+  dealIds.forEach(dealId => {
+    const dealProps = dealsMap.get(dealId);
+    if (!dealProps) return;
+
+    const dealName = dealProps.dealname || "";
+    
+    // 親取引情報の取得
+    const originId = dealProps.origin_deal_id;
+    let parentDealName = "";
+    let parentFirstRecordedDate = "";
+
+    if (originId) {
+      const parentDeal = parentDealsMap.get(originId);
+      if (parentDeal) {
+        parentDealName = parentDeal.dealname;
+        parentFirstRecordedDate = parentDeal.first_recorded_date || ""; // 親の計上日
+      } else {
+        parentDealName = "(削除済/取得不可)";
+      }
+    }
+
+    // 会社名・年月抽出
+    const splitName = dealName.split(" ");
+    let companyName = splitName[0]; 
+    let targetMonth = splitName.length > 1 ? splitName[1] : ""; 
+
+    if (dealProps.first_recorded_date) {
+      const d = new Date(dealProps.first_recorded_date);
+      const yyyy = d.getFullYear();
+      const mm = ("0" + (d.getMonth() + 1)).slice(-2);
+      targetMonth = `${yyyy}-${mm}`;
+    }
+
+    const commonData = [
+      dealId,
+      parentDealName,          // 親取引名
+      parentFirstRecordedDate, // 親取引計上日
+      dealName,                // 取引名
+      companyName,
+      targetMonth,
+      dealProps.dealstage,
+      dealProps.hubspot_owner_id,
+      dealProps.contract_certainty,
+      dealProps.first_recorded_date
+    ];
+
+    // 紐付いている商品IDリストを取得
+    const linkedLineItemIds = associationsMap.get(dealId) || [];
+
+    if (linkedLineItemIds.length > 0) {
+      linkedLineItemIds.forEach(liId => {
+        const item = lineItemsMap.get(liId);
+        if (item) {
+          rows.push([
+            ...commonData,
+            item.name,
+            Number(item.price || 0),
+            Number(item.quantity || 0),
+            Number(item.amount || 0),
+            item.period,
+            item.start_date
+          ]);
+        } else {
+          rows.push([...commonData, "(詳細取得失敗)", 0, 0, 0, "", ""]);
+        }
+      });
+    } else {
+      rows.push([...commonData, "(商品なし)", 0, 0, 0, "", ""]);
+    }
+  });
+
+  // 7. シートへ書き込み
+  sheet.clear();
+  if (rows.length > 0) {
+    sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+    sheet.getRange(1, 1, 1, rows[0].length).setFontWeight("bold").setBackground("#e6f7ff");
+    sheet.setFrozenRows(1);
+  }
+
+  Logger.log("✅ テスト完了: raw_report_data に最新10件（親情報付き）を出力しました。");
+}
