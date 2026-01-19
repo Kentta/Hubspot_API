@@ -1,0 +1,1344 @@
+/**
+ * HubSpot 営業Deal → レポートDeal 自動同期システム (v1.2 Discount Logic Fix)
+ * * 概要:
+ * 1. 営業パイプラインの更新を検知
+ * 2. 契約期間(P12M等)に基づいて、月ごとのレポート用Dealに自動展開
+ * 3. 商品変更時は「全削除＆再作成」で整合性を担保
+ * 4. ステージ変更時は「プロパティ更新」のみ実行
+ * 5. Discount（値引き）は「月数で割らずにそのまま」適用するよう修正
+ */
+
+// ==========================================
+// 1. 設定・定数 (CONFIG)
+// ==========================================
+const HUBSPOT_TOKEN = 'XXX'; 
+const SALES_PIPELINE_ID = 'default';        // 営業用パイプライン
+const REPORT_PIPELINE_ID = '810580395';     // レポート用パイプラインID
+const SHEET_NAME = 'sync_state';            // 状態管理用シート名
+
+// ステージマッピング (営業パイプラインのステージID : レポート用のステージID)
+const STAGE_MAP = {
+  "default": {
+    "appointmentscheduled": "1193683864",   // ヒアリング
+    "qualifiedtobuy": "1193683865",         // 一次提案
+    "presentationscheduled": "1193683866",  // 二次提案
+    "decisionmakerboughtin": "1193683867",  // 最終提案
+    "contractsent": "1193683868",           // 仮受注
+    "closedwon": "1193683869",              // 受注
+    "1193842304": "1228201899",             // 案件消滅
+    "1193842305": "1193683870",             // 失注
+    "closedlost": "1230843265",             // リサイクル（AM戻し） 
+    "1214496305": "1230843266",             // AMナーチャリング 
+    "2413958": "1230843267",             // リサイクル（BDR戻し）
+  }
+};
+
+
+// ==========================================
+// 2. メイン実行関数 (MAIN TRIGGER)
+// ==========================================
+function main_syncDeals() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    Logger.log(`❌ シート '${SHEET_NAME}' が見つかりません。作成してください。`);
+    return;
+  }
+
+  // 1. 直近24時間以内に更新された営業Dealを取得
+  const updatedDeals = api_fetchRecentlyUpdatedDeals(240);
+  if (updatedDeals.length === 0) {
+    Logger.log("⏳ 更新された営業Dealはありません。終了します。");
+    return;
+  }
+
+  // 2. シートの全データをメモリに読み込む
+  const lastRow = sheet.getLastRow();
+  // 読み込み範囲を11列(K列)まで拡張
+  const sheetData = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, 11).getValues() : [];
+  
+  const stateMap = new Map();
+  sheetData.forEach((row, index) => {
+    stateMap.set(String(row[0]), { rowIndex: index + 2, rowData: row });
+  });
+
+  Logger.log(`🔍 対象Deal数: ${updatedDeals.length}件`);
+
+  // 3. 各Dealについて同期処理
+  updatedDeals.forEach(deal => {
+    try {
+      processSingleDeal(deal, sheet, stateMap);
+    } catch (e) {
+      Logger.log(`❌ エラー (Deal: ${deal.properties.dealname}): ${e.message}`);
+    }
+  });
+}
+
+/**
+ * 個別のDealに対する処理ロジック
+ */
+function processSingleDeal(deal, sheet, stateMap) {
+  const dealId = deal.id;
+  const props = deal.properties;
+  
+  // 現在の商品状態を取得
+  const currentLineItemIds = api_fetchLineItemIdsForDeal(dealId);
+  const currentSnapshot = {};
+  
+  currentLineItemIds.forEach(id => {
+    const detail = api_fetchLineItemDetail(id);
+    if(detail && detail.properties) {
+      currentSnapshot[id] = {
+        name: detail.properties.name,
+        price: detail.properties.price,
+        quantity: detail.properties.quantity,
+        period: detail.properties.hs_recurring_billing_period,
+        start: detail.properties.hs_recurring_billing_start_date,
+        discount: detail.properties.discount || "0" 
+      };
+    }
+  });
+  
+  const currentSnapshotJson = JSON.stringify(currentSnapshot);
+  const lineItemIdsStr = "'" + currentLineItemIds.join(",");
+
+  const state = stateMap.get(dealId);
+  let actionLog = "";
+
+  if (!state) {
+    // --- 新規検知 ---
+    actionLog = "新規作成";
+    logic_rebuildReportDeals(dealId, props, currentSnapshot);
+
+    sheet.appendRow([
+      dealId, props.dealname, props.dealstage, props.pipeline, 
+      props.contract_expected_date, props.contract_certainty,
+      lineItemIdsStr, currentSnapshotJson,
+      props.hs_lastmodifieddate, new Date().toISOString(),
+      props.hubspot_owner_id || ""
+    ]);
+
+  } else {
+    // --- 既存更新 ---
+    const lastSnapshotJson = state.rowData[7] || "{}";
+    const lastName = state.rowData[1];
+    const lastStage = state.rowData[2];
+    const rawLastDate = state.rowData[4]; 
+    const lastCertainty = state.rowData[5];
+    const lastOwnerId = state.rowData[10];
+
+    // 日付正規化
+    const normalizeDate = (d) => {
+      if (!d) return "";
+      if (d instanceof Date) {
+        return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+      }
+      return String(d);
+    };
+
+    const lastDateStr = normalizeDate(rawLastDate);
+    const newDateStr = props.contract_expected_date || "";
+
+    // 判定
+    const isRebuildRequired = (
+      currentSnapshotJson !== lastSnapshotJson || 
+      String(lastName || "") !== String(props.dealname || "")
+    );
+
+    const isStageDiff = String(lastStage || "") !== String(props.dealstage || "");
+    const isDateDiff = lastDateStr !== newDateStr;
+    const isCertaintyDiff = String(lastCertainty || "") !== String(props.contract_certainty || "");
+    const isOwnerDiff = String(lastOwnerId || "") !== String(props.hubspot_owner_id || "");
+
+    const isPropUpdateRequired = (isStageDiff || isDateDiff || isCertaintyDiff || isOwnerDiff);
+
+    if (isRebuildRequired) {
+      actionLog = "重要変更(商品or名前) -> 全再構築";
+      logic_rebuildReportDeals(dealId, props, currentSnapshot);
+    } else if (isPropUpdateRequired) {
+      const reasons = [];
+      if(isStageDiff) reasons.push(`Stage[${lastStage}→${props.dealstage}]`);
+      if(isDateDiff) reasons.push(`Date[${lastDateStr}→${newDateStr}]`);
+      if(isCertaintyDiff) reasons.push(`Certainty[${lastCertainty}→${props.contract_certainty}]`);
+      if(isOwnerDiff) reasons.push(`Owner[${lastOwnerId}→${props.hubspot_owner_id}]`);
+      
+      actionLog = `プロパティ変更(${reasons.join(", ")}) -> 更新のみ`;
+      logic_updateReportProperties(dealId, props);
+    } else {
+      actionLog = "変更なし -> スキップ";
+    }
+
+    if (actionLog.includes("再構築") || actionLog.includes("更新のみ")) {
+       const newRow = [
+        dealId, props.dealname, props.dealstage, props.pipeline, 
+        props.contract_expected_date, props.contract_certainty,
+        lineItemIdsStr,
+        currentSnapshotJson,
+        props.hs_lastmodifieddate, new Date().toISOString(),
+        props.hubspot_owner_id || ""
+      ];
+      sheet.getRange(state.rowIndex, 1, 1, 11).setValues([newRow]);
+    }
+  }
+
+  Logger.log(`[${props.dealname}] ${actionLog}`);
+}
+
+
+// ==========================================
+// 3. ロジック関数 (CORE LOGIC)
+// ==========================================
+
+/**
+ * ロジックA: 再構築
+ */
+function logic_rebuildReportDeals(originDealId, salesProps, snapshot) {
+  const existingDeals = api_searchExistingReportDeals(originDealId);
+  if (existingDeals.length > 0) {
+    api_batchArchiveDeals(existingDeals.map(d => d.id));
+    Utilities.sleep(1000); 
+  }
+
+  if (Object.keys(snapshot).length === 0) return;
+
+  // データの月次展開
+  const monthlyData = helper_expandMonthlyData(snapshot);
+
+  const companyName = salesProps.dealname.split("_")[0];
+  const reportStage = STAGE_MAP["default"][salesProps.dealstage];
+  
+  if (!reportStage) {
+    Logger.log(`⚠️ マッピングされていないステージのため作成スキップ: ${salesProps.dealstage}`);
+    return;
+  }
+
+  Object.keys(monthlyData).sort().forEach(ym => {
+    const m = monthlyData[ym];
+    const [yyyy, mm] = ym.split("-");
+
+    const dealPayload = {
+      dealname: `${companyName} ${yyyy}年${mm}月分`,
+      pipeline: REPORT_PIPELINE_ID,
+      dealstage: reportStage,
+      origin_deal_id: originDealId,
+      hubspot_owner_id: salesProps.hubspot_owner_id || "",
+      amount: m.amount, 
+      first_recorded_date: m.first_recorded_date,
+      contract_expected_date: salesProps.contract_expected_date || "",
+      contract_certainty: salesProps.contract_certainty || ""
+    };
+
+    const newDealId = api_createDeal(dealPayload);
+
+    if (newDealId) {
+      m.lineItems.forEach(li => {
+        api_createLineItemAndAssociate(newDealId, li);
+      });
+    }
+    
+    Utilities.sleep(500); 
+  });
+}
+
+/**
+ * ロジックB: 更新のみ
+ */
+function logic_updateReportProperties(originDealId, salesProps) {
+  const existingDeals = api_searchExistingReportDeals(originDealId);
+  if (existingDeals.length === 0) return;
+
+  const reportStage = STAGE_MAP["default"][salesProps.dealstage];
+
+  const inputs = existingDeals.map(d => {
+    return {
+      id: d.id,
+      properties: {
+        dealstage: reportStage || d.properties.dealstage,
+        contract_certainty: salesProps.contract_certainty,
+        contract_expected_date: salesProps.contract_expected_date,
+        hubspot_owner_id: salesProps.hubspot_owner_id 
+      }
+    };
+  });
+
+  api_batchUpdateDeals(inputs);
+}
+
+
+// ==========================================
+// 4. データ展開ヘルパー (MATH helper)
+// ==========================================
+/**
+ * 商品スナップショットを受け取り、月ごとに集計したデータを返す
+ * ★修正: Discountは月割せずそのまま適用
+ */
+function helper_expandMonthlyData(snapshot) {
+  let monthlyDeals = {}; 
+
+  Object.values(snapshot).forEach(item => {
+    let price = Number(item.price || 0);
+    const qty = Number(item.quantity || 0);
+    const name = item.name || "";
+    
+    // 値引き(HubSpotのAPI仕様上、これは「単価に対する値引」または「月額値引」として返ってきている)
+    const discountValue = Number(item.discount || 0);
+
+    // 商品名によるマイナス補正 (手動調整用)
+    if (name.includes("【減額】") || name.includes("▼") || name.includes("値引")) {
+      if (price > 0) price = price * -1;
+    }
+
+    // 期間解析
+    const periodStr = item.period || "P1M"; 
+    const months = Number(periodStr.replace("P", "").replace("M", "")) || 1;
+    
+    // ★修正箇所: Discountは月数で割らない (APIの値 = 月ごとの値引き額とみなす)
+    const monthlyDiscount = discountValue;
+    
+    // 月次MRR = (単価 * 数量) - 月次値引き額
+    const mrr = (price * qty) - monthlyDiscount;
+
+    const startDateStr = item.start;
+    if (!startDateStr) return; 
+
+    let startDate = new Date(startDateStr);
+    let originalDay = startDate.getDate();
+
+    for (let i = 0; i < months; i++) {
+      let temp = new Date(startDate);
+      temp.setDate(1); 
+      temp.setMonth(temp.getMonth() + i);
+
+      let year = temp.getFullYear();
+      let month = temp.getMonth();
+      let newDate = new Date(year, month, originalDay);
+
+      if (newDate.getMonth() !== month) {
+        newDate = new Date(year, month + 1, 0);
+      }
+
+      let yyyy = newDate.getFullYear();
+      let mm = ("0" + (newDate.getMonth() + 1)).slice(-2);
+      let dd = ("0" + newDate.getDate()).slice(-2);
+      const billingDate = `${yyyy}-${mm}-${dd}`;
+      const ym = `${yyyy}-${mm}`;
+
+      if (!monthlyDeals[ym]) {
+        monthlyDeals[ym] = {
+          amount: 0,
+          first_recorded_date: billingDate,
+          lineItems: []
+        };
+      }
+
+      monthlyDeals[ym].amount += mrr; // 割引後の金額を加算
+      monthlyDeals[ym].lineItems.push({
+        name: item.name,
+        price: price,
+        quantity: qty,
+        discount: monthlyDiscount, // そのままの値をセット
+        hs_recurring_billing_period: "P1M",
+        hs_recurring_billing_start_date: billingDate
+      });
+    }
+  });
+
+  return monthlyDeals;
+}
+
+
+// ==========================================
+// 5. HubSpot API クライアント (API CLIENT)
+// ==========================================
+
+function api_fetchRecentlyUpdatedDeals(hours) {
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/search`;
+  
+  const payload = {
+    filterGroups: [
+      {
+        filters: [
+          { propertyName: "hs_lastmodifieddate", operator: "GTE", value: since },
+          { propertyName: "pipeline", operator: "EQ", value: SALES_PIPELINE_ID }
+        ]
+      }
+    ],
+    properties: [
+      "dealname", "dealstage", "pipeline", 
+      "hubspot_owner_id", 
+      "contract_expected_date", "contract_certainty", 
+      "hs_lastmodifieddate"
+    ],
+    limit: 100
+  };
+  return _fetchHubSpot("POST", url, payload).results || [];
+}
+
+/**
+ * 特定の取引に紐付いている商品(Line Item)のIDリストを取得する
+ * ※ 監査などの大量処理でもエラーになりにくい「軽量版API」を使用
+ * ※ この変更は main_syncDeals にも適用され、同期の安定性が向上します
+ */
+function api_fetchLineItemIdsForDeal(dealId) {
+  // 紐付け情報だけを専門に取得するエンドポイント（通信が軽く確実）
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/${dealId}/associations/line_items`;
+  
+  try {
+    const data = _fetchHubSpot("GET", url);
+    // data.results が空、または存在しない場合は空配列を返す
+    if (!data.results || data.results.length === 0) {
+      return [];
+    }
+    return data.results.map(r => r.id);
+  } catch (e) {
+    // APIレート制限(429)などでエラーになった場合、
+    // ここで空配列を返すと「商品なし」と誤判定されるため、
+    // ログにエラーを出して、意図的に「空」を返す（スキップされるようにする）
+    Logger.log(`⚠️ 商品取得エラー (DealID: ${dealId}): ${e.message}`);
+    return []; 
+  }
+}
+
+function api_fetchLineItemDetail(itemId) {
+  // properties に discount を追加
+  const url = `https://api.hubapi.com/crm/v3/objects/line_items/${itemId}?properties=name,price,quantity,hs_recurring_billing_period,hs_recurring_billing_start_date,discount`;
+  try {
+    return _fetchHubSpot("GET", url);
+  } catch(e) { return null; }
+}
+
+function api_searchExistingReportDeals(originDealId) {
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/search`;
+  const payload = {
+    filterGroups: [{ filters: [{ propertyName: "origin_deal_id", operator: "EQ", value: originDealId }] }],
+    properties: ["dealname", "dealstage"],
+    limit: 100
+  };
+  return _fetchHubSpot("POST", url, payload).results || [];
+}
+
+function api_batchArchiveDeals(ids) {
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/batch/archive`;
+  const inputs = ids.map(id => ({ id: id }));
+  return _fetchHubSpot("POST", url, { inputs });
+}
+
+function api_batchUpdateDeals(inputs) {
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/batch/update`;
+  return _fetchHubSpot("POST", url, { inputs });
+}
+
+function api_createDeal(properties) {
+  const url = `https://api.hubapi.com/crm/v3/objects/deals`;
+  const data = _fetchHubSpot("POST", url, { properties });
+  return data.id;
+}
+
+function api_createLineItemAndAssociate(dealId, props) {
+  const url = `https://api.hubapi.com/crm/v3/objects/line_items`;
+  const payload = {
+    properties: props,
+    associations: [
+      {
+        to: { id: dealId },
+        types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 20 }] 
+      }
+    ]
+  };
+  return _fetchHubSpot("POST", url, payload).id;
+}
+
+// 共通Fetch関数
+function _fetchHubSpot(method, url, payload = null) {
+  const options = {
+    method: method,
+    headers: {
+      Authorization: `Bearer ${HUBSPOT_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    muteHttpExceptions: true
+  };
+  if (payload) options.payload = JSON.stringify(payload);
+
+  const res = UrlFetchApp.fetch(url, options);
+  const code = res.getResponseCode();
+  const content = res.getContentText();
+
+  if (code >= 400) {
+    throw new Error(`HubSpot API Error (${code}): ${content}`);
+  }
+  return content ? JSON.parse(content) : {};
+}
+
+// ==========================================
+// 6. テスト・シミュレーション用 (TEST / DRY-RUN)
+// ==========================================
+
+/**
+ * 【安全なテスト実行用】
+ * HubSpotへの書き込みを行わず、実行されるはずの処理をログに出力します。
+ * ロジックの正しさ（月次展開の計算など）を確認するために使用してください。
+ */
+function run_DryRun_Simulation() {
+  Logger.log("🚀 ドライラン（擬似実行）を開始します...");
+  Logger.log("※ この処理ではHubSpotへの書き込みは一切行われません。\n");
+
+  const SHEET_NAME = 'sync_state';
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    Logger.log("❌ シートが見つかりません");
+    return;
+  }
+
+  // 1. 直近の更新データを取得（ここは本番と同じ）
+  const updatedDeals = api_fetchRecentlyUpdatedDeals(240);
+  Logger.log(`🔍 直近24時間の更新対象Deal数: ${updatedDeals.length}件`);
+
+  if (updatedDeals.length === 0) {
+    Logger.log("対象がないため終了します。");
+    return;
+  }
+
+  // 2. シートの状態マップ作成
+  const lastRow = sheet.getLastRow();
+  const sheetData = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, 10).getValues() : [];
+  const stateMap = new Map();
+  sheetData.forEach((row, index) => {
+    stateMap.set(String(row[0]), { rowIndex: index + 2, rowData: row });
+  });
+
+  // 3. ループ処理（書き込み部分をシミュレーション関数に置換）
+  updatedDeals.forEach(deal => {
+    try {
+      test_processSingleDeal_Safe(deal, stateMap);
+    } catch (e) {
+      Logger.log(`❌ テストエラー: ${e.message}`);
+    }
+  });
+
+  Logger.log("\n✅ ドライラン終了");
+}
+
+/**
+ * 処理判定のシミュレーション
+ */
+function test_processSingleDeal_Safe(deal, stateMap) {
+  const dealId = deal.id;
+  const props = deal.properties;
+  const dealName = props.dealname;
+
+  Logger.log(`\n--------------------------------------------------`);
+  Logger.log(`📁 営業Deal検証: [${dealId}] ${dealName}`);
+  Logger.log(`   Stage: ${props.dealstage}`);
+
+  // 現在の商品状態を取得
+  const currentLineItemIds = api_fetchLineItemIdsForDeal(dealId);
+  const currentSnapshot = {};
+  
+  currentLineItemIds.forEach(id => {
+    const detail = api_fetchLineItemDetail(id);
+    if(detail && detail.properties) {
+      currentSnapshot[id] = {
+        name: detail.properties.name,
+        price: detail.properties.price,
+        quantity: detail.properties.quantity,
+        period: detail.properties.hs_recurring_billing_period,
+        start: detail.properties.hs_recurring_billing_start_date
+      };
+    }
+  });
+
+  const currentSnapshotJson = JSON.stringify(currentSnapshot);
+  const state = stateMap.get(dealId);
+
+  // 判定ロジック
+  if (!state) {
+    Logger.log("   👉 判定結果: 【新規作成】が必要です");
+    test_simulateRebuild(dealId, props, currentSnapshot);
+  } else {
+    const lastSnapshotJson = state.rowData[7] || "{}";
+    const lastStage = state.rowData[2];
+    const lastName = state.rowData[1];
+
+    const isLineItemChanged = (currentSnapshotJson !== lastSnapshotJson);
+    const isPropChanged = (lastStage !== props.dealstage || lastName !== props.dealname);
+
+    if (isLineItemChanged) {
+      Logger.log("   👉 判定結果: 【商品変更検知】 -> 全再構築ロジック実行");
+      Logger.log(`      (旧): ${lastSnapshotJson}`);
+      Logger.log(`      (新): ${currentSnapshotJson}`);
+      test_simulateRebuild(dealId, props, currentSnapshot);
+    } else if (isPropChanged) {
+      Logger.log("   👉 判定結果: 【プロパティ変更】 -> 更新ロジック実行");
+      Logger.log(`      変更内容: ステージ[${lastStage}→${props.dealstage}] / 名前[${lastName}→${props.dealname}]`);
+    } else {
+      Logger.log("   👉 判定結果: 【変更なし】 -> スキップ");
+    }
+  }
+}
+
+/**
+ * 再構築ロジックのシミュレーション（計算結果を表示）
+ */
+function test_simulateRebuild(originDealId, salesProps, snapshot) {
+  // 1. 既存検索（実際には削除しない）
+  const existingDeals = api_searchExistingReportDeals(originDealId);
+  if (existingDeals.length > 0) {
+    Logger.log(`      🗑 [Mock] 既存のレポートDeal ${existingDeals.length}件 を削除します`);
+  } else {
+    Logger.log(`      🗑 [Mock] 削除対象の既存Dealはありません`);
+  }
+
+  if (Object.keys(snapshot).length === 0) {
+    Logger.log("      ⚠️ 商品がないため、作成処理は行われません");
+    return;
+  }
+
+  // 2. 展開ロジックの検証（ここが重要！）
+  // 本番と同じ helper 関数を使って計算結果を確認する
+  const monthlyData = helper_expandMonthlyData(snapshot);
+
+  Logger.log(`      📦 [Mock] 以下の内容でレポートDealを作成します:`);
+  
+  const reportStage = STAGE_MAP["default"][salesProps.dealstage] || "マップなし(ERROR)";
+  const companyName = salesProps.dealname.split("_")[0];
+
+  Object.keys(monthlyData).sort().forEach(ym => {
+    const m = monthlyData[ym];
+    const [yyyy, mm] = ym.split("-");
+    
+    // 作成されるはずのDeal名
+    const dealName = `${companyName} ${yyyy}年${mm}月分`;
+    
+    Logger.log(`         ---------------------------`);
+    Logger.log(`         📅 対象月: ${ym}`);
+    Logger.log(`            Deal名: ${dealName}`);
+    Logger.log(`            Stage : ${reportStage}`);
+    Logger.log(`            Amount: ${m.amount.toLocaleString()} 円`);
+    Logger.log(`            計上日: ${m.first_recorded_date}`);
+    Logger.log(`            商品数: ${m.lineItems.length} 個`);
+    
+    // 商品の内訳も表示
+    m.lineItems.forEach(li => {
+      Logger.log(`              - ${li.name} (¥${li.price} x ${li.quantity})`);
+    });
+  });
+}
+
+// ==========================================
+// 7. 初回セットアップ用 (INIT ONLY)
+// ==========================================
+
+/**
+ * 【初回限定】現状のスナップショット作成関数（修正版）
+ * ※ ID列の自動変換を防ぐため "'" を付与
+ */
+function init_CaptureCurrentState_Only() {
+  const SHEET_NAME = 'sync_state';
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    Logger.log("❌ シートが見つかりません");
+    return;
+  }
+
+  const HOURS_BACK = 240; 
+  Logger.log(`📥 過去 ${HOURS_BACK} 時間以内の営業Dealを取得して記録します...`);
+  
+  const activeDeals = api_fetchRecentlyUpdatedDeals(HOURS_BACK);
+  if (activeDeals.length === 0) return;
+
+  const lastRow = sheet.getLastRow();
+  const existingIds = new Set();
+  if (lastRow > 1) {
+    const data = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    data.forEach(r => existingIds.add(String(r[0])));
+  }
+
+  let addedCount = 0;
+
+  activeDeals.forEach(deal => {
+    const dealId = deal.id;
+    if (existingIds.has(String(dealId))) return; 
+
+    const props = deal.properties;
+    
+    const currentLineItemIds = api_fetchLineItemIdsForDeal(dealId);
+    const currentSnapshot = {};
+    
+    currentLineItemIds.forEach(id => {
+      const detail = api_fetchLineItemDetail(id);
+      if(detail && detail.properties) {
+        currentSnapshot[id] = {
+          name: detail.properties.name,
+          price: detail.properties.price,
+          quantity: detail.properties.quantity,
+          period: detail.properties.hs_recurring_billing_period,
+          start: detail.properties.hs_recurring_billing_start_date
+        };
+      }
+    });
+
+    // ★修正: 先頭に ' を付ける
+    const lineItemIdsStr = "'" + currentLineItemIds.join(",");
+
+    sheet.appendRow([
+      dealId, 
+      props.dealname, 
+      props.dealstage, 
+      props.pipeline, 
+      props.contract_expected_date, 
+      props.contract_certainty,
+      lineItemIdsStr, // ★修正済みの文字列
+      JSON.stringify(currentSnapshot),
+      props.hs_lastmodifieddate, 
+      new Date().toISOString(),
+      props.hubspot_owner_id,
+    ]);
+
+    addedCount++;
+    Logger.log(`✅ 記録完了: [${dealId}] ${props.dealname}`);
+  });
+
+  Logger.log(`\n🎉 セットアップ完了: ${addedCount} 件をシートに記録しました。`);
+}
+
+// ==========================================
+// 9. デバッグ用 (特定IDの計算ロジック検証)
+// ==========================================
+
+/**
+ * 特定の営業取引IDを指定して、APIからどのような値が返ってきており、
+ * GASがどう計算してしまうかをログで確認する診断用関数
+ * ※ HubSpotへの書き込みは一切行いません
+ */
+function debug_AnalyzeSpecificDealLogic() {
+  // ▼ここに検証したい「親取引(営業Deal)のID」を入れてください
+  const TARGET_DEAL_ID = "48504049306"; 
+
+  Logger.log(`🕵️‍♀️ 取引ID: ${TARGET_DEAL_ID} の詳細診断を開始します...`);
+
+  // 1. Line Item IDを取得
+  const lineItemIds = api_fetchLineItemIdsForDeal(TARGET_DEAL_ID);
+  if (lineItemIds.length === 0) {
+    Logger.log("⚠️ この取引には商品項目(Line Item)が紐付いていません。");
+    return;
+  }
+  Logger.log(`📦 商品項目数: ${lineItemIds.length}個`);
+
+  // 2. 各商品の生データと計算結果を表示
+  lineItemIds.forEach((itemId, index) => {
+    Logger.log(`\n--- 商品 ${index + 1} (ID: ${itemId}) ---`);
+
+    // APIから生データを取得
+    const detail = api_fetchLineItemDetail(itemId);
+    const p = detail.properties;
+
+    // 生ログ出力（HubSpotが何と返しているか）
+    Logger.log(`[API生データ]`);
+    Logger.log(`  name (商品名) : ${p.name}`);
+    Logger.log(`  price (単価)  : ${p.price}`);
+    Logger.log(`  qty (数量)    : ${p.quantity}`);
+    Logger.log(`  discount (値引): ${p.discount}`); // ★ここが重要
+    Logger.log(`  amount (小計) : ${p.amount}`);
+    Logger.log(`  period (期間) : ${p.hs_recurring_billing_period}`);
+    Logger.log(`  start (開始日): ${p.hs_recurring_billing_start_date}`);
+
+    // --- 現在のロジックでの計算シミュレーション ---
+    Logger.log(`\n[現在のロジックでの計算結果]`);
+    
+    const price = Number(p.price || 0);
+    const qty = Number(p.quantity || 0);
+    const rawDiscount = Number(p.discount || 0);
+    
+    // 期間計算
+    const periodStr = p.hs_recurring_billing_period || "P1M"; 
+    const months = Number(periodStr.replace("P", "").replace("M", "")) || 1;
+    Logger.log(`  -> 契約月数: ${months}ヶ月`);
+
+    // ★問題の箇所（現在の計算式）
+    const monthlyDiscount = rawDiscount / months; 
+    Logger.log(`  -> 月次値引き額 (値引÷月数): ${Math.round(monthlyDiscount)} 円`);
+
+    const mrr = (price * qty) - monthlyDiscount;
+    Logger.log(`  -> 算出されるMRR ( (単価x数量) - 月次値引 ): ${Math.round(mrr)} 円`);
+
+    // --- 修正案のシミュレーション（割り算しない場合） ---
+    Logger.log(`\n[修正案: 割り算しない場合]`);
+    const mrr_fixed = (price * qty) - rawDiscount;
+    Logger.log(`  -> 月次値引き額 (値引そのまま): ${rawDiscount} 円`);
+    Logger.log(`  -> 算出されるMRR: ${mrr_fixed} 円`);
+  });
+  
+  Logger.log("\n✅ 診断終了");
+}
+
+// ==========================================
+// 10. 整合性診断ツール (AUDIT TOOL)
+// ==========================================
+
+/**
+ * 【診断実行用】
+ * 営業用取引を基準に、レポート用取引との整合性をチェックし、
+ * ズレがあるものや欠損しているものをシート「audit_results」に出力します。
+ * ※ HubSpotへの書き込み・変更は一切行いません（Read Only）。
+ */
+function audit_CompareSalesAndReportDeals() {
+  const AUDIT_SHEET_NAME = 'audit_results';
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(AUDIT_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(AUDIT_SHEET_NAME);
+  } else {
+    sheet.clear(); // 毎回リセット
+  }
+
+  Logger.log("🕵️‍♀️ 整合性チェックを開始します...");
+
+  // ヘッダー作成
+  const headers = [
+    "営業Deal ID", "営業取引名", "ステージ", "所有者ID", "商品数",
+    "本来あるべき総額(理論値)", "実際のレポート総額(実測値)", "差額", 
+    "レポート取引数", "判定", "詳細エラー内容"
+  ];
+  sheet.appendRow(headers);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#ddd");
+
+  // 1. 営業用パイプラインの取引を全取得（商品があるものに絞るため全件取得してからフィルタ）
+  const salesDeals = fetchAllSalesDeals();
+  Logger.log(`🔍 営業取引総数: ${salesDeals.length}件`);
+
+  // 2. レポート用パイプラインの取引を全取得（比較用キャッシュ）
+  // 親IDをキーにしてグループ化しておく
+  const reportDealsMap = fetchAllReportDealsGroupedByOrigin();
+  Logger.log(`🔍 レポート取引総数: ${Object.keys(reportDealsMap).length}グループ (親単位)`);
+
+  const outputRows = [];
+
+  // 3. 1件ずつ検証
+  salesDeals.forEach(deal => {
+    const dealId = deal.id;
+    const props = deal.properties;
+    const dealName = props.dealname;
+    const dealStage = props.dealstage;
+    
+    // 商品項目を取得
+    const lineItemIds = api_fetchLineItemIdsForDeal(dealId);
+    
+    // 商品がない取引は今回の調査対象外とする（あるいは「商品なし」として出すか）
+    if (lineItemIds.length === 0) {
+      // outputRows.push([dealId, dealName, dealStage, props.hubspot_owner_id, 0, 0, 0, 0, 0, "対象外", "商品なし"]);
+      return; 
+    }
+
+    // --- A. 本来あるべき姿（理論値）の計算 ---
+    let expectedTotalAmount = 0;
+    const lineItems = lineItemIds.map(id => api_fetchLineItemDetail(id)).filter(i => i); // 詳細取得
+
+    lineItems.forEach(item => {
+      const p = item.properties;
+      let price = Number(p.price || 0);
+      const qty = Number(p.quantity || 0);
+      const discount = Number(p.discount || 0);
+      const name = p.name || "";
+
+      // マイナス補正ロジック（本番と同じ）
+      if (name.includes("【減額】") || name.includes("▼") || name.includes("値引")) {
+        if (price > 0) price = price * -1;
+      }
+
+      // 期間計算
+      const periodStr = p.hs_recurring_billing_period || "P1M"; 
+      const months = Number(periodStr.replace("P", "").replace("M", "")) || 1;
+
+      // 月次MRR = (単価 * 数量) - 値引き
+      // ※これを月数分積み上げたものが「この商品の理論総額」
+      const monthlyMrr = (price * qty) - discount;
+      const itemTotal = monthlyMrr * months;
+
+      expectedTotalAmount += itemTotal;
+    });
+
+    // --- B. 実際の姿（実測値）の集計 ---
+    const childDeals = reportDealsMap[dealId] || [];
+    let actualTotalAmount = 0;
+    const errorMessages = [];
+
+    // レポート取引の整合性チェック
+    const correctReportStage = STAGE_MAP["default"][dealStage]; // 本来あるべきステージ
+
+    childDeals.forEach(child => {
+      actualTotalAmount += Number(child.properties.amount || 0);
+
+      // ステージチェック
+      if (correctReportStage && child.properties.dealstage !== correctReportStage) {
+        errorMessages.push(`ステージ不一致(子:${child.properties.dealstage})`);
+      }
+      // 確度チェック
+      if (props.contract_certainty && child.properties.contract_certainty !== props.contract_certainty) {
+        errorMessages.push(`確度不一致`);
+      }
+    });
+
+    // --- C. 比較判定 ---
+    const diff = expectedTotalAmount - actualTotalAmount;
+    let status = "OK";
+    
+    // 許容誤差（1円未満は無視など）
+    if (Math.abs(diff) > 1) {
+      status = "金額不一致";
+      errorMessages.push(`金額ズレ: ${diff.toLocaleString()}円`);
+    } else if (childDeals.length === 0) {
+      status = "レポート未作成";
+      errorMessages.push("レポート取引が存在しません");
+    }
+
+    // エラーメッセージの整理
+    const uniqueErrors = [...new Set(errorMessages)];
+    if (uniqueErrors.length > 0 && status === "OK") {
+      status = "プロパティ不一致"; // 金額はあってるがステージなどが違う
+    }
+
+    // --- D. 出力対象に追加 ---
+    // 正常なものも出すか、異常なものだけ出すか。今回は「全て」出してシートでフィルタできるようにします。
+    outputRows.push([
+      dealId,
+      dealName,
+      dealStage,
+      props.hubspot_owner_id,
+      lineItems.length,
+      expectedTotalAmount,
+      actualTotalAmount,
+      diff,
+      childDeals.length,
+      status,
+      uniqueErrors.join(", ")
+    ]);
+  });
+
+  // シートへ一括書き込み
+  if (outputRows.length > 0) {
+    sheet.getRange(2, 1, outputRows.length, headers.length).setValues(outputRows);
+    
+    // 条件付き書式（エラーを見やすく）
+    const range = sheet.getRange(2, 1, outputRows.length, headers.length);
+    range.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
+  }
+
+  Logger.log("✅ 診断完了: シート 'audit_results' を確認してください。");
+}
+
+// ----------------------------------------------------
+// 以下、診断用ヘルパー関数
+// ----------------------------------------------------
+
+// 営業取引を全件取得
+function fetchAllSalesDeals() {
+  let allResults = [];
+  let after = 0;
+  let hasMore = true;
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/search`;
+
+  while (hasMore) {
+    const payload = {
+      filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: SALES_PIPELINE_ID }] }],
+      properties: ["dealname", "dealstage", "hubspot_owner_id", "contract_certainty"],
+      limit: 100,
+      after: after
+    };
+    const res = _fetchHubSpot("POST", url, payload);
+    allResults = allResults.concat(res.results || []);
+    if (res.paging && res.paging.next) {
+      after = res.paging.next.after;
+    } else {
+      hasMore = false;
+    }
+    Utilities.sleep(50);
+  }
+  return allResults;
+}
+
+// レポート取引を全件取得し、親IDごとのMapにして返す
+function fetchAllReportDealsGroupedByOrigin() {
+  let allResults = [];
+  let after = 0;
+  let hasMore = true;
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/search`;
+
+  while (hasMore) {
+    const payload = {
+      filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: REPORT_PIPELINE_ID }] }],
+      properties: ["dealname", "dealstage", "amount", "contract_certainty", "origin_deal_id"], // 親IDを取得
+      limit: 100,
+      after: after
+    };
+    const res = _fetchHubSpot("POST", url, payload);
+    allResults = allResults.concat(res.results || []);
+    if (res.paging && res.paging.next) {
+      after = res.paging.next.after;
+    } else {
+      hasMore = false;
+    }
+    Utilities.sleep(50);
+  }
+
+  // グループ化処理
+  const map = {};
+  allResults.forEach(deal => {
+    const parentId = deal.properties.origin_deal_id;
+    if (parentId) {
+      if (!map[parentId]) map[parentId] = [];
+      map[parentId].push(deal);
+    }
+  });
+  return map;
+}
+
+// ==========================================
+// 13. 今期(FY2026) 優先度診断ツール (全項目完全チェック版)
+// ==========================================
+
+function audit_CheckFY2026_Priority() {
+  const AUDIT_SHEET_NAME = 'audit_fy2026_priority';
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(AUDIT_SHEET_NAME);
+
+  if (!sheet) sheet = ss.insertSheet(AUDIT_SHEET_NAME);
+  else sheet.clear();
+
+  Logger.log("🕵️‍♀️ 期間・金額・プロパティの完全診断を開始します...");
+
+  // 決算期設定 (2025/07 - 2026/06)
+  const FY_START_YM = 202105;
+  const FY_END_YM   = 202606;
+
+  // ヘッダー（チェック項目を追加）
+  const headers = [
+    "優先度", "判定アクション", "現状ステータス", 
+    "詳細エラー内容", // ★ここになぜNGかが出ます
+    "営業Deal ID", "営業取引名", 
+    "理論期間", "実際期間", 
+    "金額差分", "レポート数"
+  ];
+  sheet.appendRow(headers);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#d9ead3");
+
+  const salesDeals = fetchAllSalesDeals();
+  const reportDealsMap = fetchAllReportDealsGroupedByOrigin();
+  const outputRows = [];
+
+  for (let i = 0; i < salesDeals.length; i++) {
+    const deal = salesDeals[i];
+    const dealId = deal.id;
+    const dealName = deal.properties.dealname;
+    const parentStage = deal.properties.dealstage;
+    const parentCertainty = deal.properties.contract_certainty || "";
+    const closeDateStr = deal.properties.closedate || "";
+
+    const lineItemIds = api_fetchLineItemIdsForDeal(dealId);
+    if (lineItemIds.length === 0) continue;
+    const lineItems = lineItemIds.map(id => api_fetchLineItemDetail(id)).filter(i => i);
+
+    // --- A. 理論値（期間・金額）の計算 ---
+    let expectedMonths = new Set();
+    let theoreticalAmount = 0;
+
+    lineItems.forEach(item => {
+      const p = item.properties;
+      let price = Number(p.price || 0);
+      const qty = Number(p.quantity || 0);
+      const discount = Number(p.discount || 0);
+      const name = p.name || "";
+      
+      if (name.includes("【減額】") || name.includes("▼") || name.includes("値引")) {
+        price = Math.abs(price) * -1;
+      }
+
+      let startDateStr = p.hs_recurring_billing_start_date || closeDateStr || deal.properties.createdate;
+      if (!startDateStr) return;
+      
+      let startDate = new Date(startDateStr);
+      const periodStr = p.hs_recurring_billing_period || "P1M"; 
+      let months = 1;
+      if (periodStr === "P1Y") months = 12;
+      else if (periodStr.startsWith("P") && periodStr.endsWith("M")) {
+        months = Number(periodStr.replace("P", "").replace("M", "")) || 1;
+      }
+
+      theoreticalAmount += ((price * qty) - discount) * months;
+
+      let calcDate = new Date(startDate);
+      calcDate.setDate(1); 
+      for (let m = 0; m < months; m++) {
+        let d = new Date(calcDate);
+        d.setMonth(d.getMonth() + m); 
+        let yyyymm = d.getFullYear() * 100 + (d.getMonth() + 1);
+        expectedMonths.add(yyyymm);
+      }
+    });
+
+    let isTargetFY = false;
+    expectedMonths.forEach(ym => {
+      if (ym >= FY_START_YM && ym <= FY_END_YM) isTargetFY = true;
+    });
+    if (!isTargetFY) continue;
+
+    // --- B. 実測値（HubSpotデータ）のチェック ---
+    const childDeals = reportDealsMap[dealId] || [];
+    let actualAmount = 0;
+    let actualMonths = new Set();
+    
+    // プロパティ不一致フラグ
+    let isStageMismatch = false;
+    let isCertaintyMismatch = false;
+
+    // 正解のステージIDを特定
+    const correctReportStageId = STAGE_MAP["default"][parentStage];
+
+    childDeals.forEach(child => {
+      actualAmount += Number(child.properties.amount || 0);
+      
+      // 期間チェック用
+      const cName = child.properties.dealname || "";
+      const match = cName.match(/(\d{4})[年\-](\d{1,2})/);
+      if (match) {
+        actualMonths.add(Number(match[1]) * 100 + Number(match[2]));
+      }
+
+      // ★追加: ステージチェック
+      if (correctReportStageId && child.properties.dealstage !== correctReportStageId) {
+        isStageMismatch = true;
+      }
+
+      // ★追加: 確度チェック (親に値がある場合のみ)
+      if (parentCertainty && child.properties.contract_certainty !== parentCertainty) {
+        isCertaintyMismatch = true;
+      }
+    });
+
+    // --- C. 総合判定 ---
+    const diffAmount = theoreticalAmount - actualAmount;
+    
+    // 期間一致チェック
+    const expArr = Array.from(expectedMonths).sort((a,b)=>a-b);
+    const actArr = Array.from(actualMonths).sort((a,b)=>a-b);
+    const isPeriodMatch = (expArr.length === actArr.length) && expArr.every((val, index) => val === actArr[index]);
+
+    const expStr = expArr.length > 0 ? `${expArr[0]}~${expArr[expArr.length-1]}` : "なし";
+    const actStr = actArr.length > 0 ? `${actArr[0]}~${actArr[actArr.length-1]}` : "なし";
+
+    let status = "正常";
+    let action = "なし";
+    let priority = "済";
+    let errorDetails = [];
+
+    // 優先順位をつけてエラー判定
+    if (childDeals.length === 0) {
+      status = "未作成";
+      action = "新規作成";
+      priority = "高";
+      errorDetails.push("レポート取引なし");
+    } else {
+      // 1. 金額チェック
+      if (Math.abs(diffAmount) > 1) {
+        status = "要修正";
+        priority = "高";
+        errorDetails.push(`金額ズレ(${diffAmount}円)`);
+      }
+      // 2. 期間チェック
+      if (!isPeriodMatch) {
+        status = "要修正";
+        priority = "高";
+        errorDetails.push("期間不一致");
+      }
+      // 3. ステージチェック
+      if (isStageMismatch) {
+        status = "要修正";
+        if (priority !== "高") priority = "中"; // 金額ズレよりは優先度低め
+        errorDetails.push("ステージ不一致");
+      }
+      // 4. 確度チェック
+      if (isCertaintyMismatch) {
+        status = "要修正";
+        if (priority !== "高") priority = "中";
+        errorDetails.push("確度不一致");
+      }
+    }
+
+    if (errorDetails.length > 0 && action === "なし") {
+      action = "更新(修正)";
+    }
+
+    outputRows.push([
+      priority,
+      action,
+      status,
+      errorDetails.join(", "), // 詳細なエラー理由を表示
+      dealId,
+      dealName,
+      expStr,
+      actStr,
+      diffAmount,
+      childDeals.length
+    ]);
+  }
+
+  if (outputRows.length > 0) {
+    sheet.getRange(2, 1, outputRows.length, headers.length).setValues(outputRows);
+    sheet.getDataRange().applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
+  }
+  
+  Logger.log("✅ 完全診断完了: シートを確認してください。");
+}
+
+// ==========================================
+// 14. 特定取引の深掘り調査ツール (DEBUG - FIXED LIMIT)
+// ==========================================
+
+function debug_InvestigateSpecificDeal() {
+  // ▼▼▼ 鹿島建設株式会社_202508 ▼▼▼
+  const TARGET_DEAL_ID = "48496858510"; 
+  // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+  Logger.log(`🕵️‍♀️ Deal ID: ${TARGET_DEAL_ID} の詳細調査を開始します...`);
+
+  // 1. 商品（Line Items）の積算内訳（スクリプトがどう計算しているか）
+  Logger.log("--- 🛒 商品データ (スクリプトの計算ロジック確認) ---");
+  const lineItemIds = api_fetchLineItemIdsForDeal(TARGET_DEAL_ID);
+  
+  if (lineItemIds.length === 0) {
+    Logger.log("⚠️ 商品が紐付いていません。");
+    return;
+  }
+
+  const lineItems = lineItemIds.map(id => api_fetchLineItemDetail(id)).filter(i => i);
+  let scriptTotal = 0;
+
+  lineItems.forEach((item, index) => {
+    const p = item.properties;
+    const name = p.name;
+    const price = Number(p.price || 0);
+    const qty = Number(p.quantity || 0);
+    const discount = Number(p.discount || 0);
+    
+    // 期間
+    const periodStr = p.hs_recurring_billing_period || "P1M";
+    let months = 1;
+    if (periodStr === "P1Y") months = 12;
+    else if (periodStr.startsWith("P") && periodStr.endsWith("M")) {
+      months = Number(periodStr.replace("P", "").replace("M", "")) || 1;
+    }
+    
+    // スクリプトの計算式
+    const subTotal = ((price * qty) - discount) * months;
+    scriptTotal += subTotal;
+
+    Logger.log(`   [${index+1}] ${name}`);
+    Logger.log(`       単価:${price} x 数量:${qty} - 値引:${discount}`);
+    Logger.log(`       期間プロパティ: ${periodStr} -> 認識月数: ${months}ヶ月`);
+    Logger.log(`       👉 スクリプト計算額: ${subTotal.toLocaleString()}円`);
+  });
+  Logger.log(`💰 スクリプトが思う合計額(Theoretical): ${scriptTotal.toLocaleString()}円`);
+
+
+  // 2. レポート取引（実測値）の内訳
+  Logger.log("\n--- 📊 レポート取引 (HubSpot上の実測値) ---");
+  
+  const reportDealsMap = fetchAllReportDealsGroupedByOrigin();
+  const childDeals = reportDealsMap[TARGET_DEAL_ID] || [];
+  let actualTotal = 0;
+
+  childDeals.forEach((child, index) => {
+    const amt = Number(child.properties.amount || 0);
+    actualTotal += amt;
+    Logger.log(`   [${index+1}] ${child.properties.dealname} | 金額: ${amt.toLocaleString()}円`);
+  });
+  Logger.log(`📉 実際の合計額(Actual): ${actualTotal.toLocaleString()}円`);
+
+  // 3. 結論
+  Logger.log("--------------------------------------------------");
+  Logger.log(`🏁 差額: ${(scriptTotal - actualTotal).toLocaleString()}円`);
+}
+
+// ==========================================
+// 16. 個別ID指定 修正実行ツール (MANUAL FIX - FIXED VERSION)
+// ==========================================
+
+/**
+ * 手動で指定したIDの取引だけを強制的に再同期（再構築）します。
+ * スプレッドシートの更新判定を無視し、HubSpotの最新状態に基づいてレポート取引を作り直します。
+ */
+function manual_FixSpecificDeals() {
+  // ▼▼▼ 修正したい営業取引のIDをここに入力（カンマ区切り） ▼▼▼
+  const TARGET_IDS = [
+      "52036274945",
+      "51339928172",
+      "48524568101",
+      "48490462772",
+      "48476988043",
+      "48499330426",
+      "48488755348"
+  ];
+  // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+  Logger.log(`🛠 個別修正を開始します。対象: ${TARGET_IDS.length}件`);
+
+  TARGET_IDS.forEach(dealId => {
+    if (!dealId) return;
+
+    try {
+      Logger.log(`👉 ID: ${dealId} のデータを取得して強制再構築します...`);
+      
+      // 下記で定義した「1件処理用の専用関数」を呼び出す
+      force_Sync_OneDeal_ById(dealId);
+      
+      Logger.log(`✅ ID: ${dealId} の処理が完了しました。`);
+    } catch (e) {
+      Logger.log(`❌ ID: ${dealId} の処理でエラーが発生しました: ${e.message}`);
+    }
+    
+    Utilities.sleep(1000); // API制限対策
+  });
+
+  Logger.log("🏁 全対象の処理が終了しました。");
+}
+
+/**
+ * 【重要】IDひとつを受け取り、必要な情報をAPIで取得してから
+ * 既存のロジック(logic_rebuildReportDeals)に渡すためのブリッジ関数
+ */
+function force_Sync_OneDeal_ById(dealId) {
+  // 1. 営業取引のプロパティをAPIから直接取得
+  // ※ main_syncDeals で取得している項目と同じものを指定
+  const url = `https://api.hubapi.com/crm/v3/objects/deals/${dealId}?properties=dealname,dealstage,pipeline,hubspot_owner_id,contract_expected_date,contract_certainty`;
+  const res = _fetchHubSpot("GET", url);
+  
+  if (!res || !res.id) {
+    throw new Error("Dealが見つかりません。IDを確認してください。");
+  }
+
+  const props = res.properties;
+
+  // 2. 商品情報(Line Items)を取得してスナップショットを作成
+  // ※ processSingleDeal の中にあるロジックと同じ構成を作る
+  const currentLineItemIds = api_fetchLineItemIdsForDeal(dealId);
+  const currentSnapshot = {};
+  
+  currentLineItemIds.forEach(id => {
+    const detail = api_fetchLineItemDetail(id);
+    if(detail && detail.properties) {
+      currentSnapshot[id] = {
+        name: detail.properties.name,
+        price: detail.properties.price,
+        quantity: detail.properties.quantity,
+        period: detail.properties.hs_recurring_billing_period,
+        start: detail.properties.hs_recurring_billing_start_date,
+        discount: detail.properties.discount || "0" 
+      };
+    }
+  });
+
+  // 3. 再構築ロジックを実行
+  // これにより、既存のレポート取引があれば削除され、正しい内容で新規作成されます
+  logic_rebuildReportDeals(dealId, props, currentSnapshot);
+}
